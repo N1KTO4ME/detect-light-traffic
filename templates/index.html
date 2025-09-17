@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Обнаружение светофора и его сигнала</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>🚦Обнаружение светофора и его сигнала</h1>
+
+        <form method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">Загрузить</button>
+        </form>
+
+        {% if status %}
+            <div class="result-block">
+                <p class="status">Активный сигнал: <b>{{ status }}</b></p>
+            </div>
+        {% endif %}
+
+        {% if result %}
+            <h2>Результат обработки:</h2>
+            <img src="{{ url_for('results', filename=result) }}" alt="Result image">
+            <br>
+            <a class="download" href="{{ url_for('results', filename=result) }}" download>⬇ Скачать результат</a>
+        {% endif %}
+
+        {% if error %}
+            <p class="error">{{ error }}</p>
+        {% endif %}
+    </div>
+</body>
+</html>
