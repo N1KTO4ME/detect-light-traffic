@@ -1,11 +1,10 @@
 import cv2
 import numpy as np
 
+
+## Обнаружение очертаний светофора
 def detect_contours_tl(img, debug=False):
-    """
-    Надёжный поиск прямоугольной рамы светофора.
-    Возвращает список (x,y,w,h).
-    """
+
     h_img, w_img = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5,5), 0)
@@ -21,7 +20,7 @@ def detect_contours_tl(img, debug=False):
     mask = cv2.bitwise_or(mask_dark, mask_light)
     mask = cv2.bitwise_or(mask, edges)
 
-    # Морфология (размер ядра адаптивен)
+    # Морфология
     ksize = max(5, int(min(w_img, h_img) / 120))  # подстраивается под разрешение
     if ksize % 2 == 0:
         ksize += 1
@@ -80,12 +79,9 @@ def detect_contours_tl(img, debug=False):
 
     return rois
 
-
+##   Находит лампы внутри прямоугольника (roi) и возвращает ОДИН цвет (самый "сильный" по яркости).
 def detect_lamps_improved(image, roi, debug=False):
-    """
-    Находит лампы внутри ROI и возвращает ОДИН цвет (самый "сильный" по яркости).
-    Если не найдено — возвращает None.
-    """
+    
     x, y, w, h = roi
     roi_img = image[y:y+h, x:x+w].copy()
     if roi_img.size == 0:
@@ -93,7 +89,7 @@ def detect_lamps_improved(image, roi, debug=False):
 
     hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
 
-    # маски (диапазоны можно подрегулировать под твою выборку)
+    # маски
     red1 = cv2.inRange(hsv, np.array([0, 80, 60]), np.array([12, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([180, 255, 255]))
     mask_red = cv2.bitwise_or(red1, red2)
@@ -144,7 +140,6 @@ def detect_lamps_improved(image, roi, debug=False):
             mean_hsv = cv2.mean(hsv, mask=mask_circle)
             mean_h, mean_s, mean_v = mean_hsv[0], mean_hsv[1], mean_hsv[2]
 
-            # требуем "светящесть" и насыщенность
             if mean_s < 50 or mean_v < 60:
                 continue
 
@@ -192,7 +187,7 @@ def detect_lamps_improved(image, roi, debug=False):
     return best['color']
 
 
-# Твоя функция показа окна оставляем как есть
+# Для простого вывода в окне с машстбариованием
 def show_fixed_window(winname, img, window_w, window_h):
     h, w = img.shape[:2]
     scale = min(window_w / w, window_h / h)
