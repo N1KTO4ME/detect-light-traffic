@@ -1,55 +1,69 @@
-from flask import Flask, render_template, request, send_from_directory
 import os
-import cv2
-from detect_traffic_light import *
+from flask import Flask, render_template, request, send_from_directory, redirect, url_for, flash
+from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
+import logging
+logging.basicConfig(level=logging.INFO, filename="logs/app.log", filemode="a",
+                    format="%(asctime)s %(levelname)s: %(message)s")
+
+from detect_traffic_light import predict_image, draw_prediction_on_image, save_result_db, model_exists
 
 UPLOAD_FOLDER = "uploads"
-RESULT_FOLDER = "uploads/results"
+RESULT_FOLDER = os.path.join(UPLOAD_FOLDER, "results")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+
+app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.secret_key = "replace-with-a-random-secret"  # для flash-сообщений
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    result_filename = None
-    signal_status = None
-
     if request.method == "POST":
+        if not model_exists():
+            flash("Модель не найдена. Сначала обучите модель (train.py).")
+            return render_template("index.html", result=None, status=None)
+
         if "file" not in request.files:
-            return render_template("index.html", error="Файл не загружен")
+            flash("Файл не найден в запросе.")
+            return render_template("index.html", result=None, status=None)
 
         file = request.files["file"]
         if file.filename == "":
-            return render_template("index.html", error="Не выбран файл")
+            flash("Файл не выбран.")
+            return render_template("index.html", result=None, status=None)
 
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(filepath)
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(save_path)
 
-        # Загружаем изображение
-        img = cv2.imread(filepath)
-        rois = detect_contours_tl(img, debug=False)
+            try:
+                pred_class, conf, probs = predict_image(save_path)
+            except Exception as e:
+                logging.exception("Prediction error")
+                flash(f"Ошибка при прогнозировании: {e}")
+                return render_template("index.html", result=None, status=None)
 
-        signal_status = "НЕ ОБНАРУЖЕН"
-        for roi in rois:
-            x, y, w, h = roi
-            cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            out_name = "result_" + filename
+            out_path = os.path.join(RESULT_FOLDER, out_name)
+            draw_prediction_on_image(save_path, out_path, pred_class, conf)
 
-            status = detect_lamps_improved(img, roi, debug=False)
-            if status:
-                signal_status = status
-                cv2.putText(img, f"Signal: {status}", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 2)
+            # Save to DB
+            save_result_db(filename, pred_class, conf, success=1)
 
-        # Сохраняем результат
-        result_filename = "result_" + file.filename
-        result_path = os.path.join(RESULT_FOLDER, result_filename)
-        cv2.imwrite(result_path, img)
+            return render_template("index.html", result=out_name, status=f"{pred_class} ({conf*100:.1f}%)")
 
-    return render_template("index.html",
-                       result=result_filename,
-                       status=signal_status,
-                       error=None)
+        else:
+            flash("Неподдерживаемый формат.")
+    return render_template("index.html", result=None, status=None)
 
 
 @app.route("/results/<filename>")
@@ -58,4 +72,4 @@ def results(filename):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=8000)
