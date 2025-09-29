@@ -1,200 +1,204 @@
-import cv2
+import os
+import json
+import sqlite3
+import logging
+from datetime import datetime
+
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+import cv2
+
+logging.basicConfig(level=logging.INFO, filename="logs/app.log",
+                    filemode="a",
+                    format="%(asctime)s %(levelname)s: %(message)s")
+
+# -------------------------
+# Параметры по умолчанию
+IMG_SIZE = (128, 128)
+BATCH_SIZE = 32
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "traffic_model.h5")
+CLASS_MAP_PATH = os.path.join(MODEL_DIR, "class_names.json")
+OUTPUTS_DIR = "outputs"
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+os.makedirs("logs", exist_ok=True)
 
 
-## Обнаружение очертаний светофора
-def detect_contours_tl(img, debug=False):
+# -------------------------
+# 1) Подготовка датасета
+def prepare_datasets(dataset_dir="dataset", img_size=IMG_SIZE, batch_size=BATCH_SIZE, seed=123):
+    """
+    Ожидается структура dataset/train/{class}/ и dataset/val/{class}/
+    Возвращает train_ds, val_ds, class_names
+    """
+    train_dir = os.path.join(dataset_dir, "train")
+    val_dir = os.path.join(dataset_dir, "val")
 
-    h_img, w_img = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    logging.info(f"Preparing datasets from {train_dir} and {val_dir}")
 
-    # Маски для тёмной и светлой рамки
-    _, mask_dark = cv2.threshold(blur, 65, 255, cv2.THRESH_BINARY_INV)  # тёмные области
-    _, mask_light = cv2.threshold(blur, 205, 255, cv2.THRESH_BINARY)     # светлые области
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        train_dir,
+        labels="inferred",
+        label_mode="int",
+        image_size=img_size,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=seed
+    )
 
-    # Границы (на всякий случай) — чтобы выделить контуры краёв
-    edges = cv2.Canny(blur, 60, 150)
-    edges = cv2.dilate(edges, np.ones((6,6), np.uint8), iterations=1)
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        val_dir,
+        labels="inferred",
+        label_mode="int",
+        image_size=img_size,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed
+    )
 
-    mask = cv2.bitwise_or(mask_dark, mask_light)
-    mask = cv2.bitwise_or(mask, edges)
+    class_names = train_ds.class_names
+    logging.info(f"Found classes: {class_names}")
 
-    # Морфология
-    ksize = max(5, int(min(w_img, h_img) / 120))  # подстраивается под разрешение
-    if ksize % 2 == 0:
-        ksize += 1
-    kernel = np.ones((ksize, ksize), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Prefetch for performance
+    AUTOTUNE = tf.data.AUTOTUNE
+    train_ds = train_ds.cache().prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Normalize datasets on the fly in model (or here)
+    normalization_layer = layers.Rescaling(1.0 / 255)
+    train_ds = train_ds.map(lambda x, y: (normalization_layer(x), y))
+    val_ds = val_ds.map(lambda x, y: (normalization_layer(x), y))
 
-    rois = []
-    img_area = w_img * h_img
-    min_area = img_area * 0.0005   # гибкий минимум
-    max_area = img_area * 0.5      # не брать сверхбольшие объекты
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        # Предпочтение контурам с 4 вершинами
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            x, y, w, h = cv2.boundingRect(approx)
-            if h == 0 or w == 0:
-                continue
-            aspect = w / float(h)
-            # Ожидаем вертикальную форму (узкая и высокая) — корректируй под свои фото
-            if 0.15 < aspect < 0.9:
-                # проверка заполнения прямоугольника (чтобы не брать сильно дырявые контуры)
-                if area / (w * h) > 0.4:
-                    rois.append((x, y, w, h))
-                    continue
-
-        # fallback: проверим boundingRect прямоугольность и соотношение сторон
-        x, y, w, h = cv2.boundingRect(cnt)
-        if h == 0 or w == 0:
-            continue
-        aspect = w / float(h)
-        if 0.12 < aspect < 1.0 and area / (w*h) > 0.35:
-            rois.append((x, y, w, h))
-
-    # отсортируем по y (сверху вниз) — полезно, если несколько
-    rois = sorted(rois, key=lambda r: r[1])
-
-    if debug:
-        dbg = img.copy()
-        for (x,y,w,h) in rois:
-            cv2.rectangle(dbg, (x,y), (x+w,y+h), (0,255,0), 2)
-        cv2.imshow("frame_mask", mask)
-        cv2.imshow("frame_debug", dbg)
-        cv2.waitKey(0)
-        cv2.destroyWindow("frame_mask")
-        cv2.destroyWindow("frame_debug")
-
-    return rois
-
-##   Находит лампы внутри прямоугольника (roi) и возвращает ОДИН цвет (самый "сильный" по яркости).
-def detect_lamps_improved(image, roi, debug=False):
-    
-    x, y, w, h = roi
-    roi_img = image[y:y+h, x:x+w].copy()
-    if roi_img.size == 0:
-        return None
-
-    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-
-    # маски
-    red1 = cv2.inRange(hsv, np.array([0, 80, 60]), np.array([12, 255, 255]))
-    red2 = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([180, 255, 255]))
-    mask_red = cv2.bitwise_or(red1, red2)
-
-    mask_yellow = cv2.inRange(hsv, np.array([14, 80, 60]), np.array([40, 255, 255]))
-    mask_green  = cv2.inRange(hsv, np.array([36, 60, 50]), np.array([100, 255, 255]))
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
-
-    color_masks = [('RED', mask_red), ('YELLOW', mask_yellow), ('GREEN', mask_green)]
-
-    found = []
-    roi_area = max(1, w * h)
-    min_area = max(30, int(roi_area * 0.0015))
-
-    for color_name, mask in color_masks:
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-
-            (cxf, cyf), r = cv2.minEnclosingCircle(cnt)
-            cx, cy, r = int(cxf), int(cyf), int(r)
-            if r <= 2:
-                continue
-
-            per = cv2.arcLength(cnt, True)
-            if per == 0:
-                continue
-            circularity = 4 * np.pi * area / (per * per)
-            # фильтруем по круговости (при необходимости поднять порог)
-            if circularity < 0.35:
-                continue
-            # относительный размер круга
-            if r > h * 0.6 or r < h * 0.03:
-                continue
-
-            # маска круга, чтобы оценить средний HSV внутри круга
-            mask_circle = np.zeros(hsv.shape[:2], dtype=np.uint8)
-            cv2.circle(mask_circle, (cx, cy), max(1, int(r * 0.85)), 255, -1)
-            mean_hsv = cv2.mean(hsv, mask=mask_circle)
-            mean_h, mean_s, mean_v = mean_hsv[0], mean_hsv[1], mean_hsv[2]
-
-            if mean_s < 50 or mean_v < 60:
-                continue
-
-            # окончательное определение цвета по mean_h (wrap-around учтён)
-            detected = None
-            if mean_h < 12 or mean_h > 160:
-                detected = 'RED 🔴'
-            elif 12 <= mean_h <= 40:
-                detected = 'YELLOW 🟡'
-            elif 36 <= mean_h <= 100:
-                detected = 'GREEN 🟢'
-            else:
-                detected = color_name
-
-            # запомним в координатах исходного изображения (не ROI)
-            found.append({
-                'cx': x + cx,
-                'cy': y + cy,
-                'r': r,
-                'color': detected,
-                'mean_hsv': mean_hsv,
-                'v': mean_v,
-                'circularity': circularity
-            })
-
-    # если ничего не найдено — возвращаем None
-    if not found:
-        if debug:
-            cv2.imshow("mask_red", mask_red); cv2.imshow("mask_yellow", mask_yellow); cv2.imshow("mask_green", mask_green)
-            dbg = image.copy()
-            cv2.rectangle(dbg, (x,y), (x+w,y+h), (0,255,0), 2)
-            cv2.imshow("roi_debug", dbg); cv2.waitKey(0); cv2.destroyAllWindows()
-        return None
-
-    # выбираем "лучший" — самый яркий по V (часто это реальный активный свет)
-    found_sorted = sorted(found, key=lambda k: (k['v'], k['circularity']), reverse=True)
-    best = found_sorted[0]
-    if debug:
-        dbg = image.copy()
-        cv2.circle(dbg, (int(best['cx']), int(best['cy'])), int(best['r']), (0,255,0), 2)
-        cv2.putText(dbg, best['color'], (int(best['cx'])-10, int(best['cy'])-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-        cv2.imshow("best_lamp", dbg); cv2.waitKey(0); cv2.destroyAllWindows()
-
-    return best['color']
+    return train_ds, val_ds, class_names
 
 
-# Для простого вывода в окне с машстбариованием
-def show_fixed_window(winname, img, window_w, window_h):
-    h, w = img.shape[:2]
-    scale = min(window_w / w, window_h / h)
-    new_w, new_h = int(w * scale), int(h * scale)
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((window_h, window_w, 3), dtype=np.uint8)
-    x_offset = (window_w - new_w) // 2
-    y_offset = (window_h - new_h) // 2
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-    cv2.imshow(winname, canvas)
+# -------------------------
+# 2) Модель (с нуля)
+def build_model(input_shape=IMG_SIZE + (3,), num_classes=3):
+    """
+    Простая CNN, обучаемая с нуля.
+    Не использует предобученные веса.
+    """
+    model = models.Sequential([
+        layers.Conv2D(32, (3, 3), activation="relu", input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Conv2D(64, (3, 3), activation="relu"),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Conv2D(128, (3, 3), activation="relu"),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Flatten(),
+        layers.Dropout(0.4),
+        layers.Dense(128, activation="relu"),
+        layers.BatchNormalization(),
+        layers.Dense(num_classes, activation="softmax")
+    ])
+
+    model.compile(optimizer="adam",
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    return model
+
+
+# -------------------------
+# 3) Тренировка, сохранение графиков и confusion matrix
+def train_model(train_ds, val_ds, class_names, epochs=20, model_path=MODEL_PATH, outputs_dir=OUTPUTS_DIR):
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    logging.info(f"Starting training for {epochs} epochs")
+
+    num_classes = len(class_names)
+    model = build_model(num_classes=num_classes)
+
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs
+    )
+
+    # Сохраняем модель
+    model.save(model_path)
+    logging.info(f"Saved model to {model_path}")
+
+    # Сохраняем class names
+    with open(CLASS_MAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(class_names, f, ensure_ascii=False)
+    logging.info(f"Saved class map to {CLASS_MAP_PATH}")
+
+    # Графики loss/accuracy
+    plot_history(history, outputs_dir)
+
+    # Confusion matrix на валидации (получим предсказания)
+    save_confusion_matrix(model, val_ds, class_names, outputs_dir)
+
+    return model, history
+
+
+def plot_history(history, outputs_dir):
+    os.makedirs(outputs_dir, exist_ok=True)
+    # loss
+    plt.figure()
+    plt.plot(history.history["loss"], label="train_loss")
+    plt.plot(history.history["val_loss"], label="val_loss")
+    plt.legend()
+    plt.title("Loss")
+    plt.savefig(os.path.join(outputs_dir, "loss.png"))
+    plt.close()
+
+    # accuracy
+    plt.figure()
+    plt.plot(history.history["accuracy"], label="train_acc")
+    plt.plot(history.history["val_accuracy"], label="val_acc")
+    plt.legend()
+    plt.title("Accuracy")
+    plt.savefig(os.path.join(outputs_dir, "accuracy.png"))
+    plt.close()
+
+    logging.info(f"Saved training plots to {outputs_dir}")
+
+
+def save_confusion_matrix(model, val_ds, class_names, outputs_dir):
+    # Соберём все метки и предсказания
+    y_true = []
+    y_pred = []
+    for x_batch, y_batch in val_ds:
+        preds = model.predict(x_batch, verbose=0)
+        preds_labels = np.argmax(preds, axis=1)
+        y_true.extend(y_batch.numpy().tolist())
+        y_pred.extend(preds_labels.tolist())
+
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    plt.title("Confusion matrix")
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            plt.text(j, i, cm[i, j], horizontalalignment="center", color="white" if cm[i, j] > cm.max() / 2 else "black")
+
+    path = os.path.join(outputs_dir, "confusion_matrix.png")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    logging.info(f"Saved confusion matrix to {path}")
+
+    # Also print classification report
+    report = classification_report(y_true, y_pred, target_names=class_names)
+    with op
