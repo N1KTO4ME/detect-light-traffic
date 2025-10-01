@@ -48,3 +48,7 @@
    ```
 ## Приложение
 > in processing...
+# Лучшее из худшего
+<img width="1200" height="800" alt="изображение" src="https://github.com/user-attachments/assets/c2f0199a-4323-4be9-9621-228996c11ff8" />
+<img width="1280" height="960" alt="изображение" src="https://github.com/user-attachments/assets/bec54f7a-e37c-4110-bfee-c68b8b3b0310" />
+
